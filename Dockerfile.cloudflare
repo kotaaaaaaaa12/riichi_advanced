@@ -1,0 +1,54 @@
+# Build the upstream checkout that this overlay is applied to.
+FROM rust:1-slim AS rust
+
+FROM elixir:1.19.6-otp-28-slim AS build
+ENV MIX_ENV=prod \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    ERL_FLAGS="+S 2:2" \
+    SECRET_KEY_BASE=build-only-placeholder-000000000000000000000000000000000000000000000000
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl git jq nodejs npm z3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+WORKDIR /app
+RUN mix local.hex --force && mix local.rebar --force
+COPY mix.exs mix.lock ./
+COPY config ./config
+COPY cloudflare/prod.exs ./config/prod.exs
+COPY cloudflare/runtime.exs ./config/runtime.exs
+RUN mix deps.get --only prod
+COPY assets/package.json assets/package-lock.json ./assets/
+RUN npm ci --prefix assets --no-audit --no-fund
+COPY . .
+# Restore these after COPY . . so the original files cannot override them.
+COPY cloudflare/prod.exs ./config/prod.exs
+COPY cloudflare/runtime.exs ./config/runtime.exs
+RUN node cloudflare/prepare-build.mjs \
+    && mix compile \
+    && mix esbuild.install --if-missing \
+    && mix esbuild riichi_advanced --minify \
+    && mix phx.digest \
+    && mix release
+
+# Use the same distribution and Erlang runtime as the build stage.
+FROM elixir:1.19.6-otp-28-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates jq libstdc++6 z3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 riichi \
+    && useradd --uid 10001 --gid riichi --home-dir /app --no-create-home riichi
+WORKDIR /app
+COPY --from=build --chown=riichi:riichi /app/_build/prod/rel/riichi_advanced ./
+RUN mkdir -p /app/log /app/tmp && chown -R riichi:riichi /app
+ENV MIX_ENV=prod \
+    PHX_SERVER=true \
+    PORT=4000 \
+    LANG=C.UTF-8 \
+    ERL_FLAGS="+S 2:2 +SDcpu 1 +SDio 1" \
+    RELEASE_DISTRIBUTION=none
+USER riichi
+EXPOSE 4000
+CMD ["/app/bin/riichi_advanced", "start"]
